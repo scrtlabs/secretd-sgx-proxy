@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package billing;
+
+option go_package = "github.com/scrtlabs/secretd-billing/proto/billing";
+
+// Billing service for subscription management
+service Billing {
+  // AddBalance verifies a payment tx and extends the caller's subscription
+  rpc AddBalance(AddBalanceRequest) returns (AddBalanceResponse);
+  // CheckBalance returns the subscription status for the authenticated caller
+  rpc CheckBalance(CheckBalanceRequest) returns (CheckBalanceResponse);
+  // GetInfo returns operator info and pricing (no auth required)
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+}
+
+message AddBalanceRequest {
+  string tx_hash = 1;
+}
+
+message AddBalanceResponse {
+  bool active = 1;
+  int64 expiry_unix = 2;
+  int64 seconds_added = 3;
+  int64 amount_received = 4;
+}
+
+message CheckBalanceRequest {}
+
+message CheckBalanceResponse {
+  bool active = 1;
+  int64 expiry_unix = 2;
+  int64 remaining_seconds = 3;
+}
+
+message GetInfoRequest {}
+
+message GetInfoResponse {
+  string operator_addr = 1;
+  int64 price_per_period = 2;
+  int64 period_seconds = 3;
+  repeated PriceTier tiers = 4;
+}
+
+message PriceTier {
+  string label = 1;
+  int64 seconds = 2;
+  int64 price_uscrt = 3;
+}

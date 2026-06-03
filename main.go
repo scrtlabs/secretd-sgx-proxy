@@ -13,14 +13,14 @@ import (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "secretd-billing",
+		Use:   "secretd-sgx-proxy",
 		Short: "Subscription sidecar proxy for gating non-SGX trace endpoints",
-		Long: `secretd-billing is a lightweight sidecar proxy that sits in front of an SGX
-validator's gRPC port. It gates trace endpoints behind time-based subscriptions.
+		Long: `secretd-sgx-proxy is a lightweight sidecar proxy that sits in front of an SGX
+validator's gRPC port. It gates trace endpoints behind block-consumption subscriptions.
 
 Non-SGX operators send a MsgSend on-chain, register the tx hash via AddBalance,
-and get access for the paid duration. The sidecar verifies secp256k1 signatures
-on every request and transparently forwards authorized calls to the validator.`,
+and get access for the paid number of blocks. The sidecar verifies secp256k1 signatures
+on every request, deduplicates requests per height, and transparently forwards authorized calls to the validator.`,
 	}
 
 	serveCmd := &cobra.Command{
@@ -34,8 +34,8 @@ on every request and transparently forwards authorized calls to the validator.`,
 	serveCmd.Flags().String("backend", "localhost:9090", "Backend validator gRPC address")
 	serveCmd.Flags().String("rpc", "http://localhost:26657", "Tendermint RPC URL for tx verification")
 	serveCmd.Flags().String("operator", "", "Operator bech32 address (payment recipient)")
-	serveCmd.Flags().Int64("price", 1000000, "Price per period in uscrt (default: 1 SCRT)")
-	serveCmd.Flags().Int64("period", 3600, "Period duration in seconds (default: 3600 = 1 hour)")
+	serveCmd.Flags().Int64("price", 1000000, "Price per package in uscrt (default: 1 SCRT)")
+	serveCmd.Flags().Int64("blocks", 100000, "Number of blocks granted per package (default: 100,000 blocks)")
 	serveCmd.Flags().String("db-path", "./subscriptions.db", "Path to subscription LevelDB")
 
 	serveCmd.MarkFlagRequired("operator")
@@ -55,15 +55,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	rpcURL, _ := cmd.Flags().GetString("rpc")
 	operator, _ := cmd.Flags().GetString("operator")
 	price, _ := cmd.Flags().GetInt64("price")
-	period, _ := cmd.Flags().GetInt64("period")
+	blocksPerPackage, _ := cmd.Flags().GetInt64("blocks")
 	dbPath, _ := cmd.Flags().GetString("db-path")
 
-	log.Printf("[BILLING] Starting secretd-billing proxy")
+	log.Printf("[BILLING] Starting secretd-sgx-proxy")
 	log.Printf("[BILLING]   Listen:   %s", listen)
 	log.Printf("[BILLING]   Backend:  %s", backend)
 	log.Printf("[BILLING]   RPC:      %s", rpcURL)
 	log.Printf("[BILLING]   Operator: %s", operator)
-	log.Printf("[BILLING]   Price:    %d uscrt per %d seconds", price, period)
+	log.Printf("[BILLING]   Price:    %d uscrt per %d blocks", price, blocksPerPackage)
 	log.Printf("[BILLING]   DB:       %s", dbPath)
 
 	freeMode := price <= 0
@@ -81,7 +81,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer store.Close()
 
 	// Create billing service
-	billing := NewBillingService(store, rpcURL, operator, price, period)
+	billing := NewBillingService(store, rpcURL, operator, price, blocksPerPackage)
 
 	// Create interceptor
 	interceptor := SubscriptionInterceptor(store)

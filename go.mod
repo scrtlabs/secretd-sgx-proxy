@@ -1,4 +1,4 @@
-module github.com/scrtlabs/secretd-billing
+module github.com/scrtlabs/secretd-sgx-proxy
 
 go 1.22.11
 

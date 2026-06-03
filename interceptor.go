@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 
 	"google.golang.org/grpc"
@@ -10,16 +9,16 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Gated trace method paths — these require an active subscription
+// Gated trace method paths — these require an active subscription.
 var gatedMethods = map[string]bool{
-	"/secret.compute.v1beta1.Query/BlockTraces":        true,
-	"/secret.compute.v1beta1.Query/EcallRecord":        true,
-	"/secret.compute.v1beta1.Query/EcallRecords":       true,
-	"/secret.compute.v1beta1.Query/EncryptedSeed":      true,
-	"/secret.compute.v1beta1.Query/MachineIDProof":     true,
-	"/secret.compute.v1beta1.Query/NetworkPubkey":      true,
-	"/secret.compute.v1beta1.Query/BlockCreateResults": true,
-	"/secret.compute.v1beta1.Query/AnalyzeCode":        true,
+	"/secret.compute.v1beta1.Query/BlockTraces":        true, // execution traces from the enclave
+	"/secret.compute.v1beta1.Query/EcallRecord":        true, // per-block random seed + validator evidence
+	"/secret.compute.v1beta1.Query/EcallRecords":       true, // batch range of ecall records
+	"/secret.compute.v1beta1.Query/EncryptedSeed":      true, // node-specific encrypted bootstrap seed
+	"/secret.compute.v1beta1.Query/MachineIDProof":     true, // SGX machine attestation proof (v1.25+)
+	"/secret.compute.v1beta1.Query/NetworkPubkey":      true, // IO + node public keys at a given height
+	"/secret.compute.v1beta1.Query/BlockCreateResults": true, // MsgStoreCode results (wasm/code hashes)
+	"/secret.compute.v1beta1.Query/AnalyzeCode":        true, // contract feature analysis (proxied to secretd)
 }
 
 // SubscriptionInterceptor returns a gRPC unary server interceptor that checks
@@ -45,15 +44,10 @@ func SubscriptionInterceptor(store *Store) grpc.UnaryServerInterceptor {
 		}
 
 		// Check subscription
-		if !store.IsActive(addr) {
-			expiry, found := store.GetExpiry(addr)
-			msg := fmt.Sprintf("subscription expired or not found for %s", addr)
-			if found {
-				msg = fmt.Sprintf("subscription expired for %s (expired at unix %d)", addr, expiry)
-			}
-			log.Printf("[BILLING] Access denied for %s: %s", info.FullMethod, msg)
+		if !store.HasBlocks(addr) {
+			log.Printf("[BILLING] Access denied for %s: insufficient blocks", info.FullMethod)
 			return nil, status.Errorf(codes.PermissionDenied,
-				"%s — send payment and call AddBalance to renew", msg)
+				"insufficient blocks — send payment and call AddBalance to renew")
 		}
 
 		log.Printf("[BILLING] Access granted for %s → %s", addr, info.FullMethod)

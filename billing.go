@@ -5,7 +5,7 @@ import (
 	"log"
 	"math"
 
-	pb "github.com/scrtlabs/secretd-billing/proto/billing"
+	pb "github.com/scrtlabs/secretd-sgx-proxy/proto/billing"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -15,21 +15,21 @@ import (
 type BillingService struct {
 	pb.UnimplementedBillingServer
 
-	store          *Store
-	rpcURL         string // Tendermint RPC URL for tx verification
-	operatorAddr   string // Bech32 address that receives payments
-	pricePerPeriod int64  // uscrt per period
-	periodSeconds  int64  // how many seconds one period lasts
+	store            *Store
+	rpcURL           string // Tendermint RPC URL for tx verification
+	operatorAddr     string // Bech32 address that receives payments
+	pricePerPackage  int64  // uscrt per package
+	blocksPerPackage int64  // how many blocks in one package
 }
 
 // NewBillingService creates a new billing service
-func NewBillingService(store *Store, rpcURL, operatorAddr string, pricePerPeriod, periodSeconds int64) *BillingService {
+func NewBillingService(store *Store, rpcURL, operatorAddr string, pricePerPackage, blocksPerPackage int64) *BillingService {
 	return &BillingService{
-		store:          store,
-		rpcURL:         rpcURL,
-		operatorAddr:   operatorAddr,
-		pricePerPeriod: pricePerPeriod,
-		periodSeconds:  periodSeconds,
+		store:            store,
+		rpcURL:           rpcURL,
+		operatorAddr:     operatorAddr,
+		pricePerPackage:  pricePerPackage,
+		blocksPerPackage: blocksPerPackage,
 	}
 }
 
@@ -58,29 +58,29 @@ func (bs *BillingService) AddBalance(ctx context.Context, req *pb.AddBalanceRequ
 			"payment sender %s does not match authenticated caller %s", sender, callerAddr)
 	}
 
-	durationSec := SecondsFromAmount(amount, bs.pricePerPeriod, bs.periodSeconds)
-	if durationSec <= 0 {
+	blocksGranted := BlocksFromAmount(amount, bs.pricePerPackage, bs.blocksPerPackage)
+	if blocksGranted <= 0 {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"payment of %d uscrt is too small (need at least 1 second of access)", amount)
+			"payment of %d uscrt is too small (need at least 1 block of access)", amount)
 	}
 
-	if err := bs.store.AddTime(callerAddr, durationSec, req.GetTxHash()); err != nil {
-		log.Printf("[BILLING] Failed to add time for %s: %v", callerAddr, err)
+	if err := bs.store.AddBlocks(callerAddr, blocksGranted, req.GetTxHash()); err != nil {
+		log.Printf("[BILLING] Failed to add blocks for %s: %v", callerAddr, err)
 		return nil, status.Errorf(codes.AlreadyExists, "failed to add balance: %v", err)
 	}
 
 	info := bs.store.GetBalance(callerAddr)
-	expiryUnix := int64(0)
+	blocksRemaining := int64(0)
 	if info != nil {
-		expiryUnix = info.ExpiryUnix
+		blocksRemaining = info.BlocksRemaining
 	}
 
-	log.Printf("[BILLING] Added %d seconds for %s (amount=%d uscrt, expiry=%d)", durationSec, callerAddr, amount, expiryUnix)
+	log.Printf("[BILLING] Added %d blocks for %s (amount=%d uscrt, total_remaining=%d)", blocksGranted, callerAddr, amount, blocksRemaining)
 
 	return &pb.AddBalanceResponse{
-		Active:         true,
-		ExpiryUnix:     expiryUnix,
-		SecondsAdded:   durationSec,
+		Active:         blocksRemaining > 0,
+		BlocksRemaining: blocksRemaining,
+		BlocksAdded:    blocksGranted,
 		AmountReceived: amount,
 	}, nil
 }
@@ -95,75 +95,62 @@ func (bs *BillingService) CheckBalance(ctx context.Context, req *pb.CheckBalance
 	info := bs.store.GetBalance(callerAddr)
 	if info == nil {
 		return &pb.CheckBalanceResponse{
-			Active:           false,
-			ExpiryUnix:       0,
-			RemainingSeconds: 0,
+			Active:          false,
+			BlocksRemaining: 0,
 		}, nil
 	}
 
-	now := currentUnix()
-	remaining := info.ExpiryUnix - now
-	active := remaining > 0
-	if remaining < 0 {
-		remaining = 0
-	}
-
 	return &pb.CheckBalanceResponse{
-		Active:           active,
-		ExpiryUnix:       info.ExpiryUnix,
-		RemainingSeconds: remaining,
+		Active:          info.BlocksRemaining > 0,
+		BlocksRemaining: info.BlocksRemaining,
 	}, nil
 }
 
-func currentUnix() int64 {
-	return timeNow().Unix()
-}
-
-// SecondsFromAmount calculates how many seconds of access a payment buys.
-// Formula: (amount * periodSeconds) / pricePerPeriod — proportional.
-func SecondsFromAmount(amount, pricePerPeriod, periodSeconds int64) int64 {
-	if pricePerPeriod <= 0 {
+// BlocksFromAmount calculates how many blocks of access a payment buys.
+// Formula: (amount * blocksPerPackage) / pricePerPackage
+func BlocksFromAmount(amount, pricePerPackage, blocksPerPackage int64) int64 {
+	if pricePerPackage <= 0 {
 		return math.MaxInt64
 	}
 	
-	// Prevent int64 overflow by calculating full periods first
-	fullPeriods := amount / pricePerPeriod
-	remainder := amount % pricePerPeriod
+	// Prevent int64 overflow by calculating full packages first
+	fullPackages := amount / pricePerPackage
+	remainder := amount % pricePerPackage
 	
-	return (fullPeriods * periodSeconds) + ((remainder * periodSeconds) / pricePerPeriod)
+	return (fullPackages * blocksPerPackage) + ((remainder * blocksPerPackage) / pricePerPackage)
 }
 
 // GetInfo returns operator info, pricing, and pre-calculated cost tiers.
 // No authentication required.
 func (bs *BillingService) GetInfo(ctx context.Context, req *pb.GetInfoRequest) (*pb.GetInfoResponse, error) {
-	// Standard periods
-	type period struct {
-		label   string
-		seconds int64
+	// Duration-based tiers (~6 seconds per block)
+	type pkg struct {
+		label  string
+		blocks int64
 	}
-	periods := []period{
-		{"1 day", 86400},
-		{"1 week", 604800},
-		{"1 month", 2592000}, // 30 days
+	packages := []pkg{
+		{"1 day (~14,400 blocks)", 14400},
+		{"1 week (~100,800 blocks)", 100800},
+		{"1 month (~432,000 blocks)", 432000},
 	}
 
 	var tiers []*pb.PriceTier
-	for _, p := range periods {
+	for _, p := range packages {
 		cost := int64(0)
-		if bs.pricePerPeriod > 0 && bs.periodSeconds > 0 {
-			cost = (p.seconds * bs.pricePerPeriod) / bs.periodSeconds
+		if bs.pricePerPackage > 0 && bs.blocksPerPackage > 0 {
+			cost = (p.blocks * bs.pricePerPackage) / bs.blocksPerPackage
 		}
 		tiers = append(tiers, &pb.PriceTier{
 			Label:      p.label,
-			Seconds:    p.seconds,
+			Blocks:     p.blocks,
 			PriceUscrt: cost,
 		})
 	}
 
 	return &pb.GetInfoResponse{
-		OperatorAddr:   bs.operatorAddr,
-		PricePerPeriod: bs.pricePerPeriod,
-		PeriodSeconds:  bs.periodSeconds,
-		Tiers:          tiers,
+		OperatorAddr:     bs.operatorAddr,
+		PricePerPackage:  bs.pricePerPackage,
+		BlocksPerPackage: bs.blocksPerPackage,
+		Tiers:            tiers,
 	}, nil
 }

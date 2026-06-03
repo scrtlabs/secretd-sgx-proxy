@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/scrtlabs/secretd-billing/proto/billing"
+	pb "github.com/scrtlabs/secretd-sgx-proxy/proto/billing"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -44,15 +45,15 @@ type ProxyServer struct {
 //
 //	(grpc.UnaryInterceptor does NOT fire for UnknownServiceHandler — the check must be inline)
 func NewProxyServer(backendAddr string, interceptor grpc.UnaryServerInterceptor, billing *BillingService, store *Store, freeMode ...bool) (*ProxyServer, error) {
-	// Connect to backend validator
-	conn, err := grpc.Dial(
+	// Connect to backend (non-blocking, connection established on first RPC)
+	conn, err := grpc.NewClient(
 		backendAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(50*1024*1024)), // 50MB for large trace responses
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second, // send pings every 10 seconds if there is no activity
-			Timeout:             3 * time.Second,  // wait 3 seconds for ping ack before considering the connection dead
-			PermitWithoutStream: true,             // send pings even without active streams
+			Time:                10 * time.Second,
+			Timeout:             3 * time.Second,
+			PermitWithoutStream: true,
 		}),
 	)
 	if err != nil {
@@ -98,25 +99,22 @@ func (ps *ProxyServer) transparentHandler(srv interface{}, serverStream grpc.Ser
 	}
 
 	// --- Subscription gate (inline, since interceptors don't fire here) ---
+	var addr string
 	if !ps.freeMode && gatedMethods[fullMethod] {
-		addr, err := VerifyRequest(serverStream.Context(), fullMethod)
+		var err error
+		addr, err = VerifyRequest(serverStream.Context(), fullMethod)
 		if err != nil {
 			log.Printf("[BILLING] Auth failed for %s: %v", fullMethod, err)
 			return status.Errorf(codes.Unauthenticated, "authentication failed: %v", err)
 		}
 
-		if !ps.store.IsActive(addr) {
-			expiry, found := ps.store.GetExpiry(addr)
-			msg := fmt.Sprintf("subscription expired or not found for %s", addr)
-			if found {
-				msg = fmt.Sprintf("subscription expired for %s (expired at unix %d)", addr, expiry)
-			}
-			log.Printf("[BILLING] Access denied for %s: %s", fullMethod, msg)
+		if !ps.store.HasBlocks(addr) {
+			log.Printf("[BILLING] Access denied for %s: insufficient blocks", fullMethod)
 			return status.Errorf(codes.PermissionDenied,
-				"%s — send payment and call AddBalance to renew", msg)
+				"insufficient blocks — send payment and call AddBalance to renew")
 		}
 
-		log.Printf("[BILLING] Access granted for %s → %s", addr, fullMethod)
+		log.Printf("[BILLING] Auth granted for %s → %s", addr, fullMethod)
 	}
 	// Forward incoming metadata to backend
 	md, _ := metadata.FromIncomingContext(serverStream.Context())
@@ -137,16 +135,30 @@ func (ps *ProxyServer) transparentHandler(srv interface{}, serverStream grpc.Ser
 	// Forward requests from client to backend
 	errChan := make(chan error, 1)
 	go func() {
+		isFirstFrame := true
 		for {
 			var frame rawFrame
 			if err := serverStream.RecvMsg(&frame); err != nil {
+				clientStream.CloseSend() // always signal EOF to backend
 				if err == io.EOF {
-					clientStream.CloseSend()
 					errChan <- nil
+				} else {
+					errChan <- err
+				}
+				return
+			}
+
+			// Perform block deduction on the first frame payload for gated methods
+			if isFirstFrame && frame.payload != nil && !ps.freeMode && gatedMethods[fullMethod] {
+				isFirstFrame = false
+				if err := processBillingDeduction(ps.store, addr, fullMethod, frame.payload); err != nil {
+					clientStream.CloseSend()
+					errChan <- status.Errorf(codes.ResourceExhausted, "billing deduction failed: %v", err)
+					if frame.payload != nil {
+						putBuffer(frame.payload)
+					}
 					return
 				}
-				errChan <- err
-				return
 			}
 
 			if err := clientStream.SendMsg(&frame); err != nil {
@@ -263,4 +275,132 @@ func (proxyCodec) Unmarshal(data []byte, v interface{}) error {
 		return nil
 	}
 	return proto.Unmarshal(data, v.(proto.Message))
+}
+
+// recvReqFromStream reads the incoming gRPC request as raw bytes.
+// Returns an owned copy safe to use after this call.
+func recvReqFromStream(stream grpc.ServerStream) ([]byte, error) {
+	var frame rawFrame
+	if err := stream.RecvMsg(&frame); err != nil {
+		return nil, err
+	}
+	data := make([]byte, len(frame.payload))
+	copy(data, frame.payload)
+	if frame.payload != nil {
+		putBuffer(frame.payload)
+	}
+	return data, nil
+}
+
+// processBillingDeduction extracts the height from the payload and deducts block credits.
+func processBillingDeduction(store *Store, addr, fullMethod string, payload []byte) error {
+	switch fullMethod {
+	case "/secret.compute.v1beta1.Query/BlockTraces",
+		"/secret.compute.v1beta1.Query/EcallRecord",
+		"/secret.compute.v1beta1.Query/NetworkPubkey",
+		"/secret.compute.v1beta1.Query/BlockCreateResults",
+		"/secret.compute.v1beta1.Query/MachineIDProof":
+		height, err := extractHeight(payload, 1)
+		if err != nil {
+			return fmt.Errorf("failed to extract height for %s: %w", fullMethod, err)
+		}
+		_, err = store.ConsumeHeight(addr, height)
+		return err
+
+	case "/secret.compute.v1beta1.Query/EncryptedSeed":
+		height, err := extractHeight(payload, 2)
+		if err != nil {
+			return fmt.Errorf("failed to extract height for %s: %w", fullMethod, err)
+		}
+		_, err = store.ConsumeHeight(addr, height)
+		return err
+
+	case "/secret.compute.v1beta1.Query/EcallRecords":
+		start, end, err := extractHeightRange(payload)
+		if err != nil {
+			return fmt.Errorf("failed to extract height range for %s: %w", fullMethod, err)
+		}
+		_, err = store.ConsumeHeightRange(addr, start, end)
+		return err
+
+	case "/secret.compute.v1beta1.Query/AnalyzeCode":
+		// No block height, just deduct 1 generic block
+		return store.ConsumeGeneric(addr)
+
+	default:
+		// Fallback for any other gated method
+		return store.ConsumeGeneric(addr)
+	}
+}
+
+// extractHeight parses a simple protobuf message to extract an int64 field.
+func extractHeight(payload []byte, fieldNum protowire.Number) (int64, error) {
+	b := payload
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return 0, fmt.Errorf("invalid tag")
+		}
+		b = b[n:]
+		
+		if num == fieldNum && typ == protowire.VarintType {
+			v, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return 0, fmt.Errorf("invalid varint")
+			}
+			return int64(v), nil
+		}
+		
+		m := protowire.ConsumeFieldValue(num, typ, b)
+		if m < 0 {
+			return 0, fmt.Errorf("invalid field value")
+		}
+		b = b[m:]
+	}
+	return 0, fmt.Errorf("height field not found in payload")
+}
+
+// extractHeightRange parses start_height (field 1) and end_height (field 2).
+func extractHeightRange(payload []byte) (start int64, end int64, err error) {
+	b := payload
+	foundStart, foundEnd := false, false
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return 0, 0, fmt.Errorf("invalid tag")
+		}
+		b = b[n:]
+		
+		if num == 1 && typ == protowire.VarintType {
+			v, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return 0, 0, fmt.Errorf("invalid varint")
+			}
+			start = int64(v)
+			foundStart = true
+			b = b[n:]
+			continue
+		}
+		if num == 2 && typ == protowire.VarintType {
+			v, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return 0, 0, fmt.Errorf("invalid varint")
+			}
+			end = int64(v)
+			foundEnd = true
+			b = b[n:]
+			continue
+		}
+		
+		m := protowire.ConsumeFieldValue(num, typ, b)
+		if m < 0 {
+			return 0, 0, fmt.Errorf("invalid field value")
+		}
+		b = b[m:]
+	}
+	
+	if !foundStart || !foundEnd {
+		return 0, 0, fmt.Errorf("missing start or end height")
+	}
+	return start, end, nil
 }

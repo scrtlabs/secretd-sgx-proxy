@@ -10,8 +10,8 @@ import (
 
 // BalanceInfo holds subscription state for a single subscriber
 type BalanceInfo struct {
-	ExpiryUnix int64    `json:"expiry_unix"`
-	TxHashes   []string `json:"tx_hashes"` // audit trail of payment tx hashes
+	BlocksRemaining int64 `json:"blocks_remaining"`
+	// TxHashes removed — replay prevention uses separate "txhash:" keys for O(1) lookup
 }
 
 // Store is a LevelDB-backed subscription store
@@ -31,9 +31,9 @@ func NewStore(dbPath string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// GetExpiry returns the expiry unix timestamp for an address.
+// GetBlocksRemaining returns the blocks remaining for an address.
 // Returns 0, false if not found.
-func (s *Store) GetExpiry(addr string) (int64, bool) {
+func (s *Store) GetBlocksRemaining(addr string) (int64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -47,7 +47,7 @@ func (s *Store) GetExpiry(addr string) (int64, bool) {
 		return 0, false
 	}
 
-	return info.ExpiryUnix, true
+	return info.BlocksRemaining, true
 }
 
 // GetBalance returns the full balance info for an address.
@@ -69,11 +69,9 @@ func (s *Store) GetBalance(addr string) *BalanceInfo {
 	return &info
 }
 
-// AddTime extends the subscription for addr by durationSec seconds.
-// If the subscription is already active, time is added to the current expiry.
-// If expired or nonexistent, time starts from now.
+// AddBlocks adds block credits to the subscription for addr.
 // Returns an error if txHash has already been used (prevents replay).
-func (s *Store) AddTime(addr string, durationSec int64, txHash string) error {
+func (s *Store) AddBlocks(addr string, blocks int64, txHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -88,27 +86,20 @@ func (s *Store) AddTime(addr string, durationSec int64, txHash string) error {
 		}
 	}
 
-	// Check for tx hash replay
-	for _, h := range info.TxHashes {
-		if h == txHash {
-			return fmt.Errorf("tx hash %s has already been used", txHash)
-		}
+	// Check for tx hash replay (O(1) — stored as separate key)
+	if _, err := s.db.Get([]byte("txhash:"+txHash), nil); err == nil {
+		return fmt.Errorf("tx hash %s has already been used", txHash)
 	}
 
-	// Calculate new expiry
-	now := timeNow().Unix()
-	if info.ExpiryUnix > now {
-		// Active subscription — extend from current expiry
-		info.ExpiryUnix += durationSec
-	} else {
-		// Expired or new — start from now
-		info.ExpiryUnix = now + durationSec
+	// Calculate new block balance
+	info.BlocksRemaining += blocks
+
+	// Record the tx hash as a separate key (prevents replay, never grows BalanceInfo)
+	if err := s.db.Put([]byte("txhash:"+txHash), []byte(addr), nil); err != nil {
+		return fmt.Errorf("failed to record tx hash: %w", err)
 	}
 
-	// Record the tx hash
-	info.TxHashes = append(info.TxHashes, txHash)
-
-	// Persist
+	// Persist subscription
 	newData, err := json.Marshal(&info)
 	if err != nil {
 		return fmt.Errorf("failed to marshal balance info: %w", err)
@@ -121,13 +112,123 @@ func (s *Store) AddTime(addr string, durationSec int64, txHash string) error {
 	return nil
 }
 
-// IsActive returns true if the address has an active (non-expired) subscription
-func (s *Store) IsActive(addr string) bool {
-	expiry, found := s.GetExpiry(addr)
+// HasBlocks returns true if the address has a positive block balance
+func (s *Store) HasBlocks(addr string) bool {
+	blocks, found := s.GetBlocksRemaining(addr)
 	if !found {
 		return false
 	}
-	return expiry > timeNow().Unix()
+	return blocks > 0
+}
+
+// ConsumeGeneric deducts 1 block without deduplication (for requests without height)
+func (s *Store) ConsumeGeneric(addr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := s.db.Get([]byte(keyPrefix+addr), nil)
+	if err != nil {
+		return fmt.Errorf("no active subscription found")
+	}
+
+	var info BalanceInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return fmt.Errorf("corrupted subscription data")
+	}
+
+	if info.BlocksRemaining <= 0 {
+		return fmt.Errorf("insufficient blocks")
+	}
+
+	info.BlocksRemaining -= 1
+	newData, _ := json.Marshal(&info)
+	return s.db.Put([]byte(keyPrefix+addr), newData, nil)
+}
+
+// ConsumeHeight deducts 1 block if the height hasn't been requested before by this user.
+// Returns true if a block was deducted, false if it was deduplicated.
+func (s *Store) ConsumeHeight(addr string, height int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	heightKey := []byte(fmt.Sprintf("sub:%s:height:%d", addr, height))
+	if _, err := s.db.Get(heightKey, nil); err == nil {
+		// Already consumed this height, deduplicate
+		return false, nil
+	}
+
+	data, err := s.db.Get([]byte(keyPrefix+addr), nil)
+	if err != nil {
+		return false, fmt.Errorf("no active subscription found")
+	}
+
+	var info BalanceInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return false, fmt.Errorf("corrupted subscription data")
+	}
+
+	if info.BlocksRemaining <= 0 {
+		return false, fmt.Errorf("insufficient blocks")
+	}
+
+	info.BlocksRemaining -= 1
+	newData, _ := json.Marshal(&info)
+	
+	if err := s.db.Put([]byte(keyPrefix+addr), newData, nil); err != nil {
+		return false, err
+	}
+	if err := s.db.Put(heightKey, []byte("1"), nil); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// ConsumeHeightRange deducts blocks for a range of heights, ignoring already consumed ones.
+func (s *Store) ConsumeHeightRange(addr string, start, end int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := s.db.Get([]byte(keyPrefix+addr), nil)
+	if err != nil {
+		return 0, fmt.Errorf("no active subscription found")
+	}
+
+	var info BalanceInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return 0, fmt.Errorf("corrupted subscription data")
+	}
+
+	var heightsToConsume []int64
+	for h := start; h <= end; h++ {
+		heightKey := []byte(fmt.Sprintf("sub:%s:height:%d", addr, h))
+		if _, err := s.db.Get(heightKey, nil); err != nil {
+			heightsToConsume = append(heightsToConsume, h)
+		}
+	}
+
+	newHeightsCount := int64(len(heightsToConsume))
+	if newHeightsCount == 0 {
+		return 0, nil
+	}
+
+	if info.BlocksRemaining < newHeightsCount {
+		return 0, fmt.Errorf("insufficient blocks to query range (needs %d, has %d)", newHeightsCount, info.BlocksRemaining)
+	}
+
+	info.BlocksRemaining -= newHeightsCount
+	newData, _ := json.Marshal(&info)
+
+	// Write updates
+	if err := s.db.Put([]byte(keyPrefix+addr), newData, nil); err != nil {
+		return 0, err
+	}
+	for _, h := range heightsToConsume {
+		heightKey := []byte(fmt.Sprintf("sub:%s:height:%d", addr, h))
+		s.db.Put(heightKey, []byte("1"), nil)
+	}
+
+	return newHeightsCount, nil
 }
 
 // Close closes the underlying LevelDB

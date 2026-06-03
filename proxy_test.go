@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // mockQueryServer is the interface required by grpc.ServiceDesc.HandlerType
@@ -126,7 +127,12 @@ func TestProxyServer_GatingAndRouting(t *testing.T) {
 	}
 
 	// ---- Test Case 2: Call gated method without credentials (should fail with Unauthenticated) ----
-	err = conn.Invoke(context.Background(), "/secret.compute.v1beta1.Query/BlockTraces", req, resp)
+	var validPayload []byte
+	validPayload = protowire.AppendTag(validPayload, 1, protowire.VarintType)
+	validPayload = protowire.AppendVarint(validPayload, 123)
+	
+	reqGated := &rawFrame{payload: validPayload}
+	err = conn.Invoke(context.Background(), "/secret.compute.v1beta1.Query/BlockTraces", reqGated, resp)
 	if err == nil {
 		t.Error("expected gated query without signature metadata to fail, but it succeeded")
 	} else {
@@ -140,7 +146,7 @@ func TestProxyServer_GatingAndRouting(t *testing.T) {
 	md, _ := SignRequest(privKeyBytes, "/secret.compute.v1beta1.Query/BlockTraces")
 	ctxWithAuth := metadata.NewOutgoingContext(context.Background(), md)
 
-	err = conn.Invoke(ctxWithAuth, "/secret.compute.v1beta1.Query/BlockTraces", req, resp)
+	err = conn.Invoke(ctxWithAuth, "/secret.compute.v1beta1.Query/BlockTraces", reqGated, resp)
 	if err == nil {
 		t.Error("expected gated query with inactive subscription to fail, but it succeeded")
 	} else {
@@ -152,9 +158,9 @@ func TestProxyServer_GatingAndRouting(t *testing.T) {
 
 	// ---- Test Case 4: Call gated method with valid subscription (should succeed and forward) ----
 	// Direct injection of balance into store
-	_ = store.AddTime(callerAddr, 1000, "TX_HASH")
+	_ = store.AddBlocks(callerAddr, 1000, "TX_HASH")
 
-	err = conn.Invoke(ctxWithAuth, "/secret.compute.v1beta1.Query/BlockTraces", req, resp)
+	err = conn.Invoke(ctxWithAuth, "/secret.compute.v1beta1.Query/BlockTraces", reqGated, resp)
 	if err != nil {
 		t.Errorf("gated query with active subscription failed: %v", err)
 	}

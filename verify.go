@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // verifyPayment is a package-level variable allowing tests to stub the payment verification logic.
@@ -82,16 +83,18 @@ func parseTransferEvents(events []txEvent, operatorAddr string) (sender string, 
 		var currentRecipient, currentSender, currentAmount string
 
 		for _, attr := range ev.Attributes {
-			// Tendermint v0.34 RPC encodes event keys/values in base64
+			// Tendermint v0.34 RPC encodes event keys/values in base64.
+			// Newer CometBFT versions return them as plain text. 
+			// We check if the decoded bytes are valid UTF-8 to prevent accidentally decoding plaintext that looks like base64 (e.g. "1000000uscrt").
 			keyBytes, err := base64.StdEncoding.DecodeString(attr.Key)
 			key := attr.Key
-			if err == nil {
+			if err == nil && utf8.Valid(keyBytes) {
 				key = string(keyBytes)
 			}
 
 			valBytes, err := base64.StdEncoding.DecodeString(attr.Value)
 			val := attr.Value
-			if err == nil {
+			if err == nil && utf8.Valid(valBytes) {
 				val = string(valBytes)
 			}
 
@@ -102,9 +105,11 @@ func parseTransferEvents(events []txEvent, operatorAddr string) (sender string, 
 				currentSender = val
 			case "amount":
 				currentAmount = val
+			}
 
-				// Cosmos SDK guarantees order: recipient, sender, amount.
-				// Evaluate immediately to safely support multi-message transfers.
+			// Evaluate as soon as all three fields for a transfer tuple are populated.
+			// This makes the logic order-independent (handles recipient->sender->amount, sender->amount->recipient, etc.)
+			if currentRecipient != "" && currentSender != "" && currentAmount != "" {
 				if currentRecipient == operatorAddr {
 					parsed := parseUscrtAmount(currentAmount)
 					if parsed > 0 {

@@ -8,11 +8,13 @@ import (
 	"strings"
 	"time"
 
-	pb "github.com/scrtlabs/secretd-billing/proto/billing"
+	pb "github.com/scrtlabs/secretd-sgx-proxy/proto/billing"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
 func newClientCmd() *cobra.Command {
@@ -114,54 +116,54 @@ func runAddBalance(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("AddBalance failed: %w", err)
 	}
 
-	fmt.Printf("\nSuccess! Added %d seconds (%.1f minutes) to your subscription.\n", resp.GetSecondsAdded(), float64(resp.GetSecondsAdded())/60.0)
+	fmt.Printf("\nSuccess! Added %d blocks to your subscription.\n", resp.GetBlocksAdded())
 	fmt.Printf("Amount Processed: %d uscrt\n", resp.GetAmountReceived())
-	fmt.Printf("New Expiry:       %s (Unix: %d)\n", time.Unix(resp.GetExpiryUnix(), 0).Format(time.RFC1123), resp.GetExpiryUnix())
+	fmt.Printf("Total Blocks Remaining: %d\n", resp.GetBlocksRemaining())
 
 	return nil
 }
 
 func runCheckBalance(cmd *cobra.Command, args []string) error {
-	url, _ := cmd.Flags().GetString("url")
-
 	privKeyBytes, err := loadPrivateKey(cmd)
 	if err != nil {
 		return err
 	}
 
-	conn, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	privKey := secp256k1.PrivKeyFromBytes(privKeyBytes)
+	pubKey := privKey.PubKey()
+	addr, err := PubKeyToBech32(pubKey)
 	if err != nil {
-		return fmt.Errorf("failed to connect to %s: %w", url, err)
+		return fmt.Errorf("failed to derive address: %w", err)
+	}
+
+	url, _ := cmd.Flags().GetString("url")
+	conn, err := grpc.NewClient(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("failed to connect to proxy: %w", err)
 	}
 	defer conn.Close()
 
-	// Generate signature metadata
+	client := pb.NewBillingClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	md, err := SignRequest(privKeyBytes, "/billing.Billing/CheckBalance")
 	if err != nil {
 		return fmt.Errorf("failed to sign request: %w", err)
 	}
+	ctx = metadata.NewOutgoingContext(ctx, md)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	outCtx := metadata.NewOutgoingContext(ctx, md)
-
-	client := pb.NewBillingClient(conn)
-	resp, err := client.CheckBalance(outCtx, &pb.CheckBalanceRequest{})
+	resp, err := client.CheckBalance(ctx, &pb.CheckBalanceRequest{})
 	if err != nil {
-		return fmt.Errorf("CheckBalance failed: %w", err)
+		return fmt.Errorf("check balance failed: %w", err)
 	}
 
-	if resp.GetActive() {
-		fmt.Printf("Status:     ACTIVE\n")
-		fmt.Printf("Expiry:     %s\n", time.Unix(resp.GetExpiryUnix(), 0).Format(time.RFC1123))
-		minutes := float64(resp.GetRemainingSeconds()) / 60.0
-		fmt.Printf("Remaining:  %.1f minutes (%d seconds)\n", minutes, resp.GetRemainingSeconds())
+	fmt.Printf("Address:         %s\n", addr)
+	fmt.Printf("Blocks Remaining:%d\n", resp.GetBlocksRemaining())
+	if resp.GetBlocksRemaining() <= 0 {
+		fmt.Printf("Status:          EXHAUSTED (buy more blocks)\n")
 	} else {
-		fmt.Printf("Status:     EXPIRED / INACTIVE\n")
-		if resp.GetExpiryUnix() > 0 {
-			fmt.Printf("Expired at: %s\n", time.Unix(resp.GetExpiryUnix(), 0).Format(time.RFC1123))
-		}
+		fmt.Printf("Status:          ACTIVE\n")
 	}
 
 	return nil
@@ -169,34 +171,24 @@ func runCheckBalance(cmd *cobra.Command, args []string) error {
 
 func runGetInfo(cmd *cobra.Command, args []string) error {
 	url, _ := cmd.Flags().GetString("url")
-
-	conn, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("failed to connect to %s: %w", url, err)
+		return fmt.Errorf("failed to connect to proxy: %w", err)
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	client := pb.NewBillingClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	client := pb.NewBillingClient(conn)
 	resp, err := client.GetInfo(ctx, &pb.GetInfoRequest{})
 	if err != nil {
-		return fmt.Errorf("GetInfo failed: %w", err)
+		return fmt.Errorf("get info failed: %w", err)
 	}
 
-	fmt.Printf("Operator:   %s\n", resp.GetOperatorAddr())
-	fmt.Printf("Base Price: %d uscrt per %d seconds\n", resp.GetPricePerPeriod(), resp.GetPeriodSeconds())
-
-	if resp.GetPricePerPeriod() == 0 {
-		fmt.Printf("\nMode: FREE — all endpoints open, no payment required\n")
-	} else {
-		fmt.Printf("\nPricing Tiers:\n")
-		for _, tier := range resp.GetTiers() {
-			scrt := float64(tier.GetPriceUscrt()) / 1_000_000.0
-			fmt.Printf("  %-10s  %d uscrt (%.2f SCRT)\n", tier.GetLabel(), tier.GetPriceUscrt(), scrt)
-		}
-	}
+	fmt.Printf("Operator Address:   %s\n", resp.GetOperatorAddr())
+	fmt.Printf("Price Per Package:  %d uscrt\n", resp.GetPricePerPackage())
+	fmt.Printf("Blocks Per Package: %d blocks\n", resp.GetBlocksPerPackage())
 
 	return nil
 }

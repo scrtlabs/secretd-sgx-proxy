@@ -1,28 +1,116 @@
-# secretd-billing
+# secretd-sgx-proxy
 
-`secretd-billing` is a gRPC transparent proxy sidecar for Secret Network SGX nodes. It gates access to expensive compute endpoints (traces, enclave records) behind time-based subscriptions, allowing node operators to monetize their SGX infrastructure.
+`secretd-sgx-proxy` is a gRPC transparent proxy sidecar for Secret Network SGX nodes. It gates access to sgx data endpoints (traces, enclave records) behind a block-based consumption billing model.
+
+---
+
+## Protocol Overview
+
+This section explains how non-SGX nodes communicate with SGX nodes and why each gRPC method exists.
+
+### Background: SGX vs Non-SGX Nodes
+
+Secret Network has two classes of nodes:
+
+- **SGX node** — runs the TEE (Trusted Execution Environment) enclave. During each block, the enclave executes secret contracts inside the SGX chip and records the outputs to a local LevelDB store (`ecall_records.db`).
+- **Non-SGX node** — a standard Cosmos node that does **not** have an SGX chip. To replay blocks that contain secret contract executions, it must fetch the enclave outputs from a trusted SGX node.
+
+### How a Non-SGX Node Uses the SGX Node
+
+The non-SGX node does **not** make a single request per block. Instead, it calls the SGX node dynamically during block production — whenever it encounters a contract execution it cannot process locally. The relevant gRPC calls are:
+
+| Method | What it returns | When it's called |
+|--------|----------------|-----------------|
+| `BlockTraces` | Every storage read/write, result, and gas used for all contract executions in a block | Once per block that contains secret contract calls |
+| `EcallRecord` | The random seed and validator set evidence fed into the enclave for a specific block | Once per block, for consensus verification |
+| `EncryptedSeed` | A node-specific seed encrypted to the requestor's SGX cert | During node bootstrap / certificate rotation |
+| `NetworkPubkey` | The IO and node public keys for a given block height | During key rotation or new node setup |
+| `MachineIDProof` | A cryptographic proof that a specific machine ID was approved by the enclave at a given height | During SGX machine attestation / approval flows |
+| `BlockCreateResults` | The wasm hash and code hash for each `MsgStoreCode` executed in a block | Once per block with contract uploads |
+| `AnalyzeCode` | Whether a contract has IBC entry points and its required features | When a non-SGX node indexes a new contract upload |
+| `EcallRecords` (batch) | A range of `EcallRecord` entries for bulk historical sync | During initial catch-up sync |
+
+### Read/Write Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         SGX Node                                     │
+│                                                                      │
+│   secretd-sgx-proxy :9191                                            │
+│          │                                                           │
+│          │ Auth check + subscription check                           │
+│          │ READS/WRITES subscriptions.db (billing)                   │
+│          │                                                           │
+│          │ Forwards authorized gated requests via gRPC               │
+│          ▼                                                           │
+│   secretd :9091                                                      │
+│          │                                                           │
+│          │ READS ecall_records.db (LevelDB)                          │
+│          │ Returns enclave outputs                                    │
+│          ▼                                                           │
+│   [gated response to client]                                         │
+└─────────────────────────────────────────────────────────────────────┘
+         ▲
+         │ gRPC request (with secp256k1 auth headers)
+         │
+┌─────────────────┐
+│ Non-SGX Node /  │
+│ Client          │
+└─────────────────┘
+```
+
+---
 
 ## Architecture
 
 ```
-[ Non-SGX Node / Client ]  ──►  [ secretd-billing :9191 ]  ──►  [ secretd :9091 ]
+[ Non-SGX Node / Client ]  ──►  [ secretd-sgx-proxy :9191 ]  ──►  [ secretd :9091 ]
                                           │
-                                 [ LevelDB Store ]
+                                  subscriptions.db
+                                  (read + write)
 ```
 
 The sidecar intercepts all gRPC traffic:
 1. **Billing RPCs** (`AddBalance`, `CheckBalance`, `GetInfo`) are handled directly.
-2. **Gated methods** (e.g., `BlockTraces`, `EcallRecord`) require an active subscription — the sidecar verifies a secp256k1 signature in gRPC metadata and checks the local store.
+2. **Gated methods** require block credits — the sidecar verifies a secp256k1 signature in gRPC metadata, checks `subscriptions.db`, deducts a block credit (deduplicated by height), and forwards the request to `secretd` via gRPC.
 3. **Everything else** is transparently forwarded to the backend as raw bytes with zero overhead.
+
+---
 
 ## Features
 
-- **Transparent gRPC Proxy** — forwards non-gated requests with zero-allocation byte pooling (`sync.Pool`)
-- **Time-Based Subscriptions** — users pay on-chain (`MsgSend`) and claim time via `AddBalance`
+- **Transparent gRPC Proxy** — all gated requests are forwarded to `secretd` after auth; non-gated requests pass through with zero-allocation byte pooling (`sync.Pool`)
+- **Block-Based Billing** — users pay on-chain (`MsgSend`) and claim a quota of blocks via `AddBalance`. Blocks are deducted per-height automatically.
 - **On-Chain Verification** — verifies payments against Tendermint RPC
 - **Stateless Auth** — secp256k1 signatures in gRPC metadata, no sessions
 - **Free Mode** — `--price 0` disables all gating for debugging or free public nodes
-- **Keepalive** — aggressive TCP keepalive on backend connection to detect dead nodes instantly
+
+---
+
+## Block Timing Reference
+
+Secret Network produces **1 block every ~6 seconds**. Use this table to estimate how many blocks correspond to real-world durations:
+
+| Duration | Blocks | Example pricing (at 1 SCRT / 14,400 blocks) |
+|----------|--------|---------------------------------------------|
+| 1 hour   | 600    | ~0.042 SCRT                                 |
+| 1 day    | 14,400 | 1 SCRT                                      |
+| 1 week   | 100,800| 7 SCRT                                      |
+| 1 month  | 432,000| 30 SCRT                                     |
+
+> **Note:** Block credits are only consumed when the subscriber actually queries a block height. If a non-SGX node is offline for a week, zero blocks are deducted. Repeated queries for the same height are also free (deduplicated).
+
+**Example systemd configuration for "1 SCRT buys 1 day" pricing:**
+```
+--price 1000000 --blocks 14400
+```
+
+**Example for "1 SCRT buys 1 week":**
+```
+--price 1000000 --blocks 100800
+```
+
+---
 
 ## Building
 
@@ -44,6 +132,8 @@ make test
 make check
 ```
 
+---
+
 ## Installation on SGX Node
 
 ### 1. Build and copy the binary
@@ -51,7 +141,7 @@ make check
 ```bash
 # On your dev machine:
 make
-scp secretd-billing root@<SGX_NODE_IP>:/usr/local/bin/
+scp secretd-sgx-proxy root@<SGX_NODE_IP>:/usr/local/bin/
 ```
 
 ### 2. Reconfigure secretd
@@ -68,20 +158,20 @@ systemctl restart secretd
 ### 3. Create systemd service
 
 ```bash
-cat > /etc/systemd/system/secretd-billing.service << 'EOF'
+cat > /etc/systemd/system/secretd-sgx-proxy.service << 'EOF'
 [Unit]
-Description=secretd-billing subscription proxy
+Description=secretd-sgx-proxy subscription proxy
 After=secretd.service
 
 [Service]
-ExecStart=/usr/local/bin/secretd-billing serve \
+ExecStart=/usr/local/bin/secretd-sgx-proxy serve \
   --listen ":9191" \
   --backend "127.0.0.1:9091" \
   --rpc "http://127.0.0.1:26657" \
   --operator "secret1YOUR_OPERATOR_ADDRESS" \
   --price 1000000 \
-  --period 86400 \
-  --db-path "/var/lib/secretd-billing/subscriptions.db"
+  --blocks 14400 \
+  --db-path "/var/lib/secretd-sgx-proxy/subscriptions.db"
 Restart=always
 RestartSec=5
 
@@ -93,17 +183,160 @@ EOF
 ### 4. Enable and start
 
 ```bash
-mkdir -p /var/lib/secretd-billing
+mkdir -p /var/lib/secretd-sgx-proxy
 systemctl daemon-reload
-systemctl enable --now secretd-billing
+systemctl enable --now secretd-sgx-proxy
 ```
 
 ### 5. Verify
 
 ```bash
 # From any machine:
-./secretd-billing client get-info --url <SGX_NODE_IP>:9191
+./secretd-sgx-proxy client get-info --url <SGX_NODE_IP>:9191
 ```
+
+---
+
+## Non-SGX Node Setup
+
+This section covers how to configure a **non-SGX node** (the client) to connect to a billing-protected SGX node.
+
+### How it works
+
+The non-SGX node calls the SGX billing proxy for every block that contains secret contract executions. It authenticates each request with a secp256k1 signature derived from a local key file. Before any gated query succeeds, the key's address must have an active block quota (paid on-chain). One block credit grants access to all traces for that specific block height.
+
+### 1. Prepare your billing key
+
+The billing key is a secp256k1 private key in hex format. It must be the **same key** you will pay with on-chain — the signer of the `MsgSend` must match the address making gated requests.
+
+Export an existing `secretd` key to hex:
+
+```bash
+mkdir -p ~/.secretd-sgx-proxy
+secretd keys export <your-key-name> --unarmored-hex --unsafe > ~/.secretd-sgx-proxy/key.hex
+chmod 600 ~/.secretd-sgx-proxy/key.hex
+```
+
+Or create a dedicated billing key first:
+
+```bash
+secretd keys add billing-key
+secretd keys export billing-key --unarmored-hex --unsafe > ~/.secretd-sgx-proxy/key.hex
+chmod 600 ~/.secretd-sgx-proxy/key.hex
+```
+
+> **Keep this file secure.** Anyone with this key can consume your subscription and send transactions from your address.
+
+The default path is `~/.secretd-sgx-proxy/key.hex`. Override with the `SECRET_BILLING_KEY_FILE` environment variable.
+
+### 2. Get your billing address
+
+```bash
+./secretd-sgx-proxy client check-balance \
+  --url <SGX_NODE_IP>:9191 \
+  --key-file ~/.secretd-sgx-proxy/key.hex
+```
+
+The operator address and pricing info can be fetched first:
+
+```bash
+./secretd-sgx-proxy client get-info --url <SGX_NODE_IP>:9191
+# Operator:   secret1...
+# Price Per Package: 1000000 uscrt
+# Blocks Per Package: 100000 blocks
+```
+
+### 3. Pay for a subscription
+
+Send a `MsgSend` on-chain to the operator address. Use `secretd` or Keplr:
+
+```bash
+secretd tx bank send <YOUR_KEY> <OPERATOR_ADDRESS> <AMOUNT>uscrt \
+  --chain-id secret-4 \
+  --node https://lcd.mainnet.secretsaturn.net:443 \
+  --gas auto
+```
+
+Note the transaction hash from the output.
+
+### 4. Register the payment
+
+```bash
+./secretd-sgx-proxy client add-balance \
+  --url <SGX_NODE_IP>:9191 \
+  --tx-hash <TX_HASH> \
+  --key-file ~/.secretd-sgx-proxy/key.hex
+
+# Success! Added 100000 blocks to your subscription.
+# Amount Processed: 1000000 uscrt
+```
+
+### 5. Configure the non-SGX node
+
+The non-SGX `secretd` process reads its SGX node list from:
+
+```
+~/.secretd/config/sgx_nodes.json
+```
+
+> **Important:** point this at the **billing proxy** port (`:9191`), not the raw secretd port (`:9090`).
+
+```bash
+cat > ~/.secretd/config/sgx_nodes.json << 'EOF'
+{
+  "nodes": [
+    "<SGX_NODE_IP>:9191"
+  ]
+}
+EOF
+```
+
+Multiple nodes are supported for redundancy — the client selects randomly and retries failed nodes:
+
+```json
+{
+  "nodes": [
+    "sgx1.example.com:9191",
+    "sgx2.example.com:9191"
+  ]
+}
+```
+
+As a fallback (if the file doesn't exist), set the `SECRET_SGX_NODE_GRPC` environment variable:
+
+```bash
+export SECRET_SGX_NODE_GRPC="<SGX_NODE_IP>:9191"
+```
+
+### 6. Start the non-SGX node
+
+```bash
+secretd start
+```
+
+The node will automatically load the billing key from `~/.secretd-sgx-proxy/key.hex` and sign every ecall request with it. You'll see log lines like:
+
+```
+INF EcallClient Loaded billing key from /root/.secretd-sgx-proxy/key.hex
+INF EcallClient Initialized with 1 SGX nodes
+```
+
+### 7. Monitor and renew
+
+Check remaining blocks:
+
+```bash
+./secretd-sgx-proxy client check-balance \
+  --url <SGX_NODE_IP>:9191 \
+  --key-file ~/.secretd-sgx-proxy/key.hex
+
+# Status:          ACTIVE
+# Blocks Remaining:99999
+```
+
+Simply repeat steps 3–4 to add more blocks. Payments stack — blocks are always added on top of the current balance.
+
+---
 
 ## Server Options
 
@@ -113,16 +346,18 @@ systemctl enable --now secretd-billing
 | `--backend` | `localhost:9090` | Backend `secretd` gRPC address |
 | `--rpc` | `http://localhost:26657` | Tendermint RPC for tx verification |
 | `--operator` | *(required)* | Bech32 address that receives payments |
-| `--price` | `1000000` | Price per period in uscrt (set to `0` for free mode) |
-| `--period` | `3600` | Period duration in seconds |
+| `--price` | `1000000` | Price per package in uscrt (set to `0` for free mode) |
+| `--blocks` | `100000` | Number of blocks granted per package |
 | `--db-path` | `./subscriptions.db` | Path to LevelDB subscription store |
+
+---
 
 ## Client CLI
 
 ### Get pricing info (no auth required)
 
 ```bash
-./secretd-billing client get-info --url <NODE>:9191
+./secretd-sgx-proxy client get-info --url <NODE>:9191
 ```
 
 ### Purchase subscription
@@ -131,7 +366,7 @@ systemctl enable --now secretd-billing
 2. Submit the tx hash:
 
 ```bash
-./secretd-billing client add-balance \
+./secretd-sgx-proxy client add-balance \
   --url <NODE>:9191 \
   --tx-hash <TX_HASH> \
   --key-file /path/to/private_key.hex
@@ -140,28 +375,9 @@ systemctl enable --now secretd-billing
 ### Check balance
 
 ```bash
-./secretd-billing client check-balance \
+./secretd-sgx-proxy client check-balance \
   --url <NODE>:9191 \
   --key-file /path/to/private_key.hex
 ```
 
-## Gated Methods
-
-The following gRPC methods require an active subscription:
-
-- `/secret.compute.v1beta1.Query/BlockTraces`
-- `/secret.compute.v1beta1.Query/EcallRecord`
-- `/secret.compute.v1beta1.Query/EcallRecords`
-- `/secret.compute.v1beta1.Query/EncryptedSeed`
-- `/secret.compute.v1beta1.Query/MachineIDProof`
-- `/secret.compute.v1beta1.Query/NetworkPubkey`
-- `/secret.compute.v1beta1.Query/BlockCreateResults`
-- `/secret.compute.v1beta1.Query/AnalyzeCode`
-
-All other methods are forwarded without authentication.
-
-## Implementation Notes
-
-- **Codec**: Uses the `mwitkow/grpc-proxy` pattern — a custom `proxyCodec` registered globally that checks for `*rawFrame` (raw proxy bytes) and delegates everything else to `proto.Marshal`/`proto.Unmarshal`. All billing message types are `protoc`-generated and implement `proto.Message`, so the codec is trivially simple with no type switches.
-- **Connection Management**: The backend connection uses aggressive keepalive (10s ping, 3s timeout) to instantly detect dead TCP connections during network partitions.
-- **Buffer Pooling**: `sync.Pool` is used for raw proxy frames to minimize GC pressure during high-throughput syncing.
+---

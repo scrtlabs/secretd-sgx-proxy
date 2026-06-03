@@ -1,4 +1,4 @@
-BINARY      := secretd-billing
+BINARY      := secretd-sgx-proxy
 GO          := go
 PROTOC      := protoc
 PROTO_DIR   := proto/billing

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/scrtlabs/secretd-billing/proto/billing"
+	pb "github.com/scrtlabs/secretd-sgx-proxy/proto/billing"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"google.golang.org/grpc/metadata"
 )
@@ -40,9 +40,9 @@ func TestBillingService_AddBalance_Success(t *testing.T) {
 	defer func() { verifyPayment = VerifyPayment }()
 
 	// Create service
-	pricePerPeriod := int64(1000000) // 1 SCRT
-	periodSeconds := int64(3600)    // 1 hour
-	service := NewBillingService(store, "http://localhost:26657", "operator_addr", pricePerPeriod, periodSeconds)
+	pricePerPackage := int64(1000000) // 1 SCRT
+	blocksPerPackage := int64(100000)
+	service := NewBillingService(store, "http://localhost:26657", "operator_addr", pricePerPackage, blocksPerPackage)
 
 	// Prepare metadata context
 	md, _ := SignRequest(privKeyBytes, "/billing.Billing/AddBalance")
@@ -58,9 +58,9 @@ func TestBillingService_AddBalance_Success(t *testing.T) {
 	if !resp.GetActive() {
 		t.Error("expected response to indicate active subscription")
 	}
-	expectedExpiry := mockTime.Unix() + 3600
-	if resp.GetExpiryUnix() != expectedExpiry {
-		t.Errorf("expected expiry %d, got %d", expectedExpiry, resp.GetExpiryUnix())
+	expectedBlocks := int64(100000)
+	if resp.GetBlocksRemaining() != expectedBlocks {
+		t.Errorf("expected blocks %d, got %d", expectedBlocks, resp.GetBlocksRemaining())
 	}
 
 	// 2. Double registration check
@@ -77,11 +77,6 @@ func TestBillingService_AddBalance_SenderMismatch(t *testing.T) {
 	store, _ := NewStore(dbPath)
 	defer store.Close()
 
-	// Mock clock
-	mockTime := time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)
-	timeNow = func() time.Time { return mockTime }
-	defer func() { timeNow = time.Now }()
-
 	// Generate subscriber private key (caller is A)
 	privKeyA, _ := secp256k1.GeneratePrivateKey()
 	privKeyBytesA := privKeyA.Serialize()
@@ -93,7 +88,7 @@ func TestBillingService_AddBalance_SenderMismatch(t *testing.T) {
 	}
 	defer func() { verifyPayment = VerifyPayment }()
 
-	service := NewBillingService(store, "http://localhost:26657", "operator_addr", 1000000, 3600)
+	service := NewBillingService(store, "http://localhost:26657", "operator_addr", 1000000, 100000)
 
 	// Invoke AddBalance using caller A's credentials
 	md, _ := SignRequest(privKeyBytesA, "/billing.Billing/AddBalance")
@@ -113,16 +108,11 @@ func TestBillingService_CheckBalance(t *testing.T) {
 	store, _ := NewStore(dbPath)
 	defer store.Close()
 
-	// Mock clock
-	mockTime := time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC)
-	timeNow = func() time.Time { return mockTime }
-	defer func() { timeNow = time.Now }()
-
 	privKey, _ := secp256k1.GeneratePrivateKey()
 	privKeyBytes := privKey.Serialize()
 	callerAddr, _ := PubKeyToBech32(privKey.PubKey())
 
-	service := NewBillingService(store, "http://localhost:26657", "operator_addr", 1000000, 3600)
+	service := NewBillingService(store, "http://localhost:26657", "operator_addr", 1000000, 100000)
 
 	md, _ := SignRequest(privKeyBytes, "/billing.Billing/CheckBalance")
 	ctx := metadata.NewIncomingContext(context.Background(), md)
@@ -137,8 +127,8 @@ func TestBillingService_CheckBalance(t *testing.T) {
 		t.Error("expected new subscriber balance to be inactive")
 	}
 
-	// 2. Add time directly to store
-	_ = store.AddTime(callerAddr, 1800, "DUMMY_TX")
+	// 2. Add blocks directly to store
+	_ = store.AddBlocks(callerAddr, 100000, "DUMMY_TX")
 
 	// 3. Check active balance
 	resp, err = service.CheckBalance(ctx, req)
@@ -148,7 +138,7 @@ func TestBillingService_CheckBalance(t *testing.T) {
 	if !resp.GetActive() {
 		t.Error("expected subscriber balance to be active")
 	}
-	if resp.GetRemainingSeconds() != 1800 {
-		t.Errorf("expected 1800 remaining seconds, got %d", resp.GetRemainingSeconds())
+	if resp.GetBlocksRemaining() != 100000 {
+		t.Errorf("expected 100000 remaining blocks, got %d", resp.GetBlocksRemaining())
 	}
 }

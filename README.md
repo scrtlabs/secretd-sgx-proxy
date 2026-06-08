@@ -136,26 +136,14 @@ make check
 
 ## Installation on SGX Node
 
-### 1. Build and copy the binary
+### 1. Download the binary from repo or build from the source
 
 ```bash
 # On your dev machine:
-make
 scp secretd-sgx-proxy root@<SGX_NODE_IP>:/usr/local/bin/
 ```
 
-### 2. Reconfigure secretd
-
-Move the `secretd` gRPC port to a local-only address so the proxy can sit in front:
-
-```bash
-# On the SGX node, edit ~/.secretd/config/app.toml:
-# Change grpc.address from "0.0.0.0:9090" to "127.0.0.1:9091"
-sed -i 's/address = "0.0.0.0:9090"/address = "127.0.0.1:9091"/' ~/.secretd/config/app.toml
-systemctl restart secretd
-```
-
-### 3. Create systemd service
+### 2. Create systemd service
 
 ```bash
 cat > /etc/systemd/system/secretd-sgx-proxy.service << 'EOF'
@@ -166,7 +154,7 @@ After=secretd.service
 [Service]
 ExecStart=/usr/local/bin/secretd-sgx-proxy serve \
   --listen ":9191" \
-  --backend "127.0.0.1:9091" \
+  --backend "127.0.0.1:9090" \
   --rpc "http://127.0.0.1:26657" \
   --operator "secret1YOUR_OPERATOR_ADDRESS" \
   --price 1000000 \
@@ -180,7 +168,7 @@ WantedBy=multi-user.target
 EOF
 ```
 
-### 4. Enable and start
+### 3. Enable and start
 
 ```bash
 mkdir -p /var/lib/secretd-sgx-proxy
@@ -188,7 +176,7 @@ systemctl daemon-reload
 systemctl enable --now secretd-sgx-proxy
 ```
 
-### 5. Verify
+### 4. Verify
 
 ```bash
 # From any machine:

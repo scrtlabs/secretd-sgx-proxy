@@ -302,10 +302,10 @@ export SECRET_SGX_NODE_GRPC="<SGX_NODE_IP>:9191"
 secretd start
 ```
 
-The node will automatically load the billing key from `~/.secretd-sgx-proxy/key.hex` and sign every ecall request with it. You'll see log lines like:
+The node will automatically load the billing key from `~/.secretd-billing/key.hex` and sign every ecall request with it. You'll see log lines like:
 
 ```
-INF EcallClient Loaded billing key from /root/.secretd-sgx-proxy/key.hex
+INF EcallClient Loaded billing key from /root/.secretd-billing/key.hex
 INF EcallClient Initialized with 1 SGX nodes
 ```
 

@@ -138,7 +138,9 @@ make check
 
 The subscription proxy sidecar runs **on the SGX node (the service provider)**. It sits in front of the actual `secretd` gRPC daemon, intercepts incoming requests, and handles the billing validation.
 
-### 1. Build and copy the binary
+### 1. Download or Build the binary
+
+You can download pre-compiled binaries from the **GitHub Actions** tab. Alternatively, you can build it from source:
 
 ```bash
 # On your dev machine:

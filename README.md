@@ -214,29 +214,29 @@ The billing key is a secp256k1 private key in hex format. It must be the **same 
 Export an existing `secretd` key to hex:
 
 ```bash
-mkdir -p ~/.secretd-sgx-proxy
-secretd keys export <your-key-name> --unarmored-hex --unsafe > ~/.secretd-sgx-proxy/key.hex
-chmod 600 ~/.secretd-sgx-proxy/key.hex
+mkdir -p ~/.secretd-billing
+secretd keys export <your-key-name> --unarmored-hex --unsafe > ~/.secretd-billing/key.hex
+chmod 600 ~/.secretd-billing/key.hex
 ```
 
 Or create a dedicated billing key first:
 
 ```bash
 secretd keys add billing-key
-secretd keys export billing-key --unarmored-hex --unsafe > ~/.secretd-sgx-proxy/key.hex
-chmod 600 ~/.secretd-sgx-proxy/key.hex
+secretd keys export billing-key --unarmored-hex --unsafe > ~/.secretd-billing/key.hex
+chmod 600 ~/.secretd-billing/key.hex
 ```
 
 > **Keep this file secure.** Anyone with this key can consume your subscription and send transactions from your address.
 
-The default path is `~/.secretd-sgx-proxy/key.hex`. Override with the `SECRET_BILLING_KEY_FILE` environment variable.
+The default path is `~/.secretd-billing/key.hex`. Override with the `SECRET_BILLING_KEY_FILE` environment variable.
 
 ### 2. Get your billing address
 
 ```bash
 ./secretd-sgx-proxy client check-balance \
   --url <SGX_NODE_IP>:9191 \
-  --key-file ~/.secretd-sgx-proxy/key.hex
+  --key-file ~/.secretd-billing/key.hex
 ```
 
 The operator address and pricing info can be fetched first:
@@ -267,7 +267,7 @@ Note the transaction hash from the output.
 ./secretd-sgx-proxy client add-balance \
   --url <SGX_NODE_IP>:9191 \
   --tx-hash <TX_HASH> \
-  --key-file ~/.secretd-sgx-proxy/key.hex
+  --key-file ~/.secretd-billing/key.hex
 
 # Success! Added 100000 blocks to your subscription.
 # Amount Processed: 1000000 uscrt
@@ -359,7 +359,7 @@ Check remaining blocks:
 ```bash
 ./secretd-sgx-proxy client check-balance \
   --url <SGX_NODE_IP>:9191 \
-  --key-file ~/.secretd-sgx-proxy/key.hex
+  --key-file ~/.secretd-billing/key.hex
 
 # Status:          ACTIVE
 # Blocks Remaining:99999

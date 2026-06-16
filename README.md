@@ -43,7 +43,7 @@ The non-SGX node does **not** make a single request per block. Instead, it calls
 │          │                                                           │
 │          │ Forwards authorized gated requests via gRPC               │
 │          ▼                                                           │
-│   secretd :9091                                                      │
+│   secretd :9090                                                      │
 │          │                                                           │
 │          │ READS ecall_records.db (LevelDB)                          │
 │          │ Returns enclave outputs                                    │
@@ -64,7 +64,7 @@ The non-SGX node does **not** make a single request per block. Instead, it calls
 ## Architecture
 
 ```
-[ Non-SGX Node / Client ]  ──►  [ secretd-sgx-proxy :9191 ]  ──►  [ secretd :9091 ]
+[ Non-SGX Node / Client ]  ──►  [ secretd-sgx-proxy :9191 ]  ──►  [ secretd :9090 ]
                                           │
                                   subscriptions.db
                                   (read + write)
@@ -134,12 +134,15 @@ make check
 
 ---
 
-## Installation on SGX Node
+## Installation on SGX Node (Provider Setup)
 
-### 1. Download the binary from repo or build from the source
+The subscription proxy sidecar runs **on the SGX node (the service provider)**. It sits in front of the actual `secretd` gRPC daemon, intercepts incoming requests, and handles the billing validation.
+
+### 1. Build and copy the binary
 
 ```bash
 # On your dev machine:
+make
 scp secretd-sgx-proxy root@<SGX_NODE_IP>:/usr/local/bin/
 ```
 
@@ -168,7 +171,22 @@ WantedBy=multi-user.target
 EOF
 ```
 
-### 3. Enable and start
+### 3. Server CLI Options
+
+The server/provider can configure behavior using these CLI arguments:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--listen` | `:9191` | Address the proxy should listen on |
+| `--backend` | `localhost:9090` | Backend `secretd` gRPC address |
+| `--rpc` | `http://localhost:26657` | Tendermint RPC URL for transaction verification |
+| `--operator` | *(required)* | Bech32 address of the operator receiving payments |
+| `--price` | `1000000` | Price per package in uscrt (set to `0` for free/open mode) |
+| `--blocks` | `100000` | Number of blocks of access granted per package |
+| `--db-path` | `./subscriptions.db` | Path to the LevelDB subscription store |
+| `--disable-dedup` | `false` | Disable block height deduplication (charge for every request, even if the height was queried before) |
+
+### 4. Enable and start
 
 ```bash
 mkdir -p /var/lib/secretd-sgx-proxy
@@ -176,7 +194,7 @@ systemctl daemon-reload
 systemctl enable --now secretd-sgx-proxy
 ```
 
-### 4. Verify
+### 5. Verify
 
 ```bash
 # From any machine:
@@ -185,13 +203,9 @@ systemctl enable --now secretd-sgx-proxy
 
 ---
 
-## Non-SGX Node Setup
+## Non-SGX Node Setup (Client Setup)
 
-This section covers how to configure a **non-SGX node** (the client) to connect to a billing-protected SGX node.
-
-### How it works
-
-The non-SGX node calls the SGX billing proxy for every block that contains secret contract executions. It authenticates each request with a secp256k1 signature derived from a local key file. Before any gated query succeeds, the key's address must have an active block quota (paid on-chain). One block credit grants access to all traces for that specific block height.
+This section covers how to configure a **non-SGX node** (the consumer/client) to connect to a billing-protected SGX node. The consumer does NOT run the proxy server; they only use the client commands and configure their node to talk to the provider's proxy.
 
 ### 1. Prepare your billing key
 
@@ -309,7 +323,36 @@ INF EcallClient Loaded billing key from /root/.secretd-billing/key.hex
 INF EcallClient Initialized with 1 SGX nodes
 ```
 
-### 7. Monitor and renew
+### 7. Client CLI Command Reference
+
+The consumer interacts with the billing sidecar using these commands:
+
+#### Get pricing info (no auth required)
+
+```bash
+./secretd-sgx-proxy client get-info --url <NODE>:9191
+```
+
+#### Purchase subscription
+
+Submit the transaction hash of your on-chain payment:
+
+```bash
+./secretd-sgx-proxy client add-balance \
+  --url <NODE>:9191 \
+  --tx-hash <TX_HASH> \
+  --key-file /path/to/private_key.hex
+```
+
+#### Check balance
+
+```bash
+./secretd-sgx-proxy client check-balance \
+  --url <NODE>:9191 \
+  --key-file /path/to/private_key.hex
+```
+
+### 8. Monitor and renew
 
 Check remaining blocks:
 
@@ -323,49 +366,5 @@ Check remaining blocks:
 ```
 
 Simply repeat steps 3–4 to add more blocks. Payments stack — blocks are always added on top of the current balance.
-
----
-
-## Server Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--listen` | `:9191` | Address to listen on |
-| `--backend` | `localhost:9090` | Backend `secretd` gRPC address |
-| `--rpc` | `http://localhost:26657` | Tendermint RPC for tx verification |
-| `--operator` | *(required)* | Bech32 address that receives payments |
-| `--price` | `1000000` | Price per package in uscrt (set to `0` for free mode) |
-| `--blocks` | `100000` | Number of blocks granted per package |
-| `--db-path` | `./subscriptions.db` | Path to LevelDB subscription store |
-
----
-
-## Client CLI
-
-### Get pricing info (no auth required)
-
-```bash
-./secretd-sgx-proxy client get-info --url <NODE>:9191
-```
-
-### Purchase subscription
-
-1. Send a `MsgSend` on-chain to the operator address (shown by `get-info`).
-2. Submit the tx hash:
-
-```bash
-./secretd-sgx-proxy client add-balance \
-  --url <NODE>:9191 \
-  --tx-hash <TX_HASH> \
-  --key-file /path/to/private_key.hex
-```
-
-### Check balance
-
-```bash
-./secretd-sgx-proxy client check-balance \
-  --url <NODE>:9191 \
-  --key-file /path/to/private_key.hex
-```
 
 ---
